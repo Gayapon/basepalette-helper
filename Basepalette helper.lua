@@ -1,5 +1,5 @@
 -- =========================================================================
--- Palette helper by Gayapón
+-- Basepalette helper by Gayapón
 -- =========================================================================
 
 -- 1. Helper para obtener rutas seguras permitidas por el sandbox de Aseprite
@@ -14,29 +14,6 @@ local function safePath(dir, filename)
     return (dir .. "/" .. filename):gsub("\\", "/")
   end
   return filename
-end
-
-local apiKeyFile = safePath(userDir, "gemini_key.txt")
-local savedApiKey = ""
-
-local fileRead = io.open(apiKeyFile, "r")
-if fileRead then
-  local readContent = fileRead:read("*all")
-  if readContent then
-    savedApiKey = readContent:gsub("%s+", "")
-  end
-  fileRead:close()
-end
-
--- Helper para guardar la API Key localmente en el directorio del usuario
-local function saveApiKey(key)
-  if key and key ~= "" then
-    local fileWrite = io.open(apiKeyFile, "w")
-    if fileWrite then
-      fileWrite:write(key)
-      fileWrite:close()
-    end
-  end
 end
 
 -- Matriz exacta de 16x16 para la esfera de sombreado
@@ -86,7 +63,6 @@ local templateData3 = {
   2, 2, 2, 2, 3, 3, 1, 1, 1, 2, 3, 3, 2, 2, 2, 2,
   2, 2, 2, 3, 2, 1, 1, 1, 1, 1, 2, 3, 3, 2, 2, 2,
   2, 2, 3, 2, 1, 1, 1, 1, 1, 1, 1, 2, 3, 3, 2, 2,
-  2, 2, 3, 1, 1, 1, 1, 1, 1, 1, 1, 2, 3, 3, 2, 2,
   2, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 3, 3, 3, 2,
   2, 3, 2, 1, 1, 1, 1, 1, 1, 1, 1, 2, 3, 3, 3, 2,
   2, 3, 2, 2, 1, 1, 1, 1, 1, 1, 2, 3, 3, 3, 3, 2,
@@ -269,61 +245,6 @@ local function shuffle8FromHexes(hexList)
   return { picked }
 end
 
--- Función para aplicar las rampas a la Paleta Activa de Aseprite
-local function applyToActivePalette(rampas)
-  local sprite = app.activeSprite
-  if not sprite then
-    app.alert("No hay ningún lienzo/sprite activo en Aseprite.\nAbre o crea un nuevo archivo para aplicar la paleta.")
-    return false
-  end
-
-  local totalColors = 0
-  for _, rampa in ipairs(rampas) do
-    totalColors = totalColors + #rampa
-  end
-
-  if totalColors == 0 then
-    app.alert("No se encontraron colores para aplicar.")
-    return false
-  end
-
-  local pal = nil
-  if sprite.palettes and #sprite.palettes > 0 then
-    pal = sprite.palettes[1]
-  elseif app.activePalette then
-    pal = app.activePalette
-  end
-
-  if not pal then
-    pal = Palette(totalColors)
-    if sprite.setPalette then
-      sprite:setPalette(pal)
-    end
-  else
-    pal:resize(totalColors)
-  end
-
-  local function doApply()
-    local colorIdx = 0
-    for _, rampa in ipairs(rampas) do
-      for _, colorObj in ipairs(rampa) do
-        pal:setColor(colorIdx, colorObj)
-        colorIdx = colorIdx + 1
-      end
-    end
-  end
-
-  if app.transaction then
-    app.transaction("Apply BasePaint Palette", doApply)
-  else
-    doApply()
-  end
-
-  app.refresh()
-  app.alert("¡Éxito! Se han aplicado " .. totalColors .. " colores ordenados a la paleta activa.")
-  return true
-end
-
 -- Dibuja el canvas de previsualización de esferas en una ventana flotante de referencia (Visor Puro)
 local function displayPreviewAndApply(rampas, title, rawHexes)
   local numRamps = #rampas
@@ -474,7 +395,16 @@ local function displayPreviewAndApply(rampas, title, rawHexes)
   previewDlg:show{ wait = false }
 end
 
--- Función para ejecutar comandos cURL de forma totalmente silenciosa en Windows (sin ventana cmd.exe) y Unix
+-- =========================================================================
+-- HELPERS DE RED PARA BASEPAINT Y ASEPRITE
+-- =========================================================================
+local decodeOnChainMetadata
+local fetchOnChainBasePaint
+local fetchTodayBasePaint
+local fetchBasePaintDirect
+local fetchCurrentAsepritePalette
+
+-- Función para ejecutar comandos cURL de forma totalmente silenciosa en Windows y Unix
 local function executeSilent(cmd)
   local isWindows = (package.config:sub(1,1) == "\\")
   if isWindows then
@@ -503,20 +433,222 @@ local function executeSilent(cmd)
   end
 end
 
--- Petición cURL a GraphQL o REST de BasePaint para una paleta específica
-local function fetchBasePaintDirect(dayNum)
-  local dNum = tonumber(dayNum) or 0
-  if dNum <= 0 then
-    return nil, "Número de paleta inválido."
+-- Decodificador de Metadata On-Chain del contrato BasePaintMetadataRegistry (0x5104482a2Ef3a03b6270D3e931eac890b86FaD01)
+decodeOnChainMetadata = function(rawHex)
+  if not rawHex then return nil, nil end
+  local cleanHex = rawHex:gsub("^0x", ""):gsub("%s+", "")
+  if #cleanHex < 64 * 8 then return nil, nil end
+
+  local words = {}
+  for i = 1, #cleanHex, 64 do
+    table.insert(words, cleanHex:sub(i, i + 63))
+  end
+  if #words < 8 then return nil, nil end
+
+  -- Word 1 es el offset a la estructura de metadata (0x20 = 32 bytes = 1 palabra)
+  local structOffsetBytes = tonumber(words[1], 16) or 32
+  local structStartIdx = 1 + math.floor(structOffsetBytes / 32) -- índice 2 en Lua
+
+  -- Nombre del tema (el offset relativo al inicio del struct está en words[structStartIdx])
+  local themeName = nil
+  local nameOffsetBytes = tonumber(words[structStartIdx], 16)
+  if nameOffsetBytes then
+    local nameLenIdx = structStartIdx + math.floor(nameOffsetBytes / 32)
+    if words[nameLenIdx] then
+      local nameLen = tonumber(words[nameLenIdx], 16)
+      if nameLen and nameLen > 0 and nameLen < 200 then
+        local nameHex = words[nameLenIdx + 1] or ""
+        local nameStr = ""
+        for byteHex in nameHex:sub(1, nameLen * 2):gmatch("%x%x") do
+          local code = tonumber(byteHex, 16)
+          if code and code >= 32 and code <= 126 then
+            nameStr = nameStr .. string.char(code)
+          end
+        end
+        if nameStr ~= "" then themeName = nameStr end
+      end
+    end
   end
 
+  -- Paleta de colores uint24[] (el offset relativo al inicio del struct está en words[structStartIdx + 1])
+  local hexes = {}
+  local palOffsetBytes = tonumber(words[structStartIdx + 1], 16)
+  if palOffsetBytes then
+    local palLenIdx = structStartIdx + math.floor(palOffsetBytes / 32)
+    if words[palLenIdx] then
+      local palCount = tonumber(words[palLenIdx], 16)
+      if palCount and palCount > 0 and palCount <= 64 then
+        for cIdx = 1, palCount do
+          local colWord = words[palLenIdx + cIdx]
+          if colWord then
+            local hex6 = colWord:sub(-6):upper()
+            if hex6:match("^%x%x%x%x%x%x$") then
+              table.insert(hexes, "#" .. hex6)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if #hexes > 0 then
+    return hexes, themeName
+  end
+  return nil, nil
+end
+
+-- Consulta on-chain a la blockchain Base (BasePaintMetadataRegistry) para el canvas indicado
+fetchOnChainBasePaint = function(dayNum)
+  local dNum = tonumber(dayNum) or 0
+  if dNum <= 0 then return nil, nil end
+
+  local hexDay = string.format("%x", dNum)
+  while #hexDay < 64 do
+    hexDay = "0" .. hexDay
+  end
+  local callData = "0xa574cea4" .. hexDay
+
+  local rpcReqFile = safePath(tempDir, "bp_onchain_req.json")
+  local rpcResFile = safePath(tempDir, "bp_onchain_res.json")
+
+  local rpcPayload = string.format([[{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "eth_call",
+    "params": [{
+      "to": "0x5104482a2Ef3a03b6270D3e931eac890b86FaD01",
+      "data": "%s"
+    }, "latest"]
+  }]], callData)
+
+  local reqFile = io.open(rpcReqFile, "w")
+  if reqFile then
+    reqFile:write(rpcPayload)
+    reqFile:close()
+  end
+
+  local rpcUrls = { "https://base-rpc.publicnode.com", "https://mainnet.base.org", "https://base.llamarpc.com", "https://1rpc.io/base" }
+  for _, rpcUrl in ipairs(rpcUrls) do
+    local curlCmd = string.format('curl -s -m 6 -X POST -H "Content-Type: application/json" -d @"%s" "%s" -o "%s"', rpcReqFile, rpcUrl, rpcResFile)
+    executeSilent(curlCmd)
+
+    local fRes = io.open(rpcResFile, "r")
+    if fRes then
+      local jsonText = fRes:read("*all") or ""
+      fRes:close()
+      pcall(function() os.remove(rpcResFile) end)
+
+      local rawResult = jsonText:match('"result"%s*:%s*"([^"]+)"')
+      if rawResult and rawResult:len() > 100 then
+        local hexes, themeName = decodeOnChainMetadata(rawResult)
+        if hexes and #hexes > 0 then
+          pcall(function() os.remove(rpcReqFile) end)
+          local title = (themeName and themeName ~= "") and (themeName .. " (#" .. tostring(dNum) .. ")") or ("Palette #" .. tostring(dNum))
+          return hexes, title
+        end
+      end
+    end
+  end
+
+  pcall(function() os.remove(rpcReqFile) end)
+  return nil, nil
+end
+
+-- Obtener la paleta actual/hoy de BasePaint
+fetchTodayBasePaint = function()
   -- 1. Intentar GraphQL primero
+  local gqlReqFile = safePath(tempDir, "bp_gql_req.json")
+  local gqlResFile = safePath(tempDir, "bp_gql_res.json")
+
+  local reqFile = io.open(gqlReqFile, "w")
+  if reqFile then
+    reqFile:write('{"query":"query { canvass(limit: 1, orderBy: \"id\", orderDirection: \"desc\") { items { id name palette } } }"}')
+    reqFile:close()
+  end
+
+  local curlGqlCmd = string.format('curl -s -X POST -H "Content-Type: application/json" -d @"%s" "https://graphql.basepaint.xyz/" -o "%s"', gqlReqFile, gqlResFile)
+  executeSilent(curlGqlCmd)
+
+  local fGql = io.open(gqlResFile, "r")
+  if fGql then
+    local jsonText = fGql:read("*all") or ""
+    fGql:close()
+    pcall(function() os.remove(gqlReqFile) end)
+    pcall(function() os.remove(gqlResFile) end)
+
+    local idVal = jsonText:match('"id":%s*(%d+)')
+    local palVal = jsonText:match('"palette":%s*"([^"]+)"')
+    local nameVal = jsonText:match('"name":%s*"([^"]+)"')
+
+    if idVal and tonumber(idVal) then
+      local onChainHexes, onChainTitle = fetchOnChainBasePaint(tonumber(idVal))
+      if onChainHexes and #onChainHexes > 0 then
+        return onChainHexes, onChainTitle
+      end
+    end
+
+    if palVal then
+      local hexes = {}
+      for hex in palVal:gmatch('#%x%x%x%x%x%x') do
+        table.insert(hexes, hex)
+      end
+      if #hexes > 0 then
+        local title = (nameVal and nameVal ~= "") and (nameVal .. " (#" .. idVal .. ")") or ("Palette #" .. idVal)
+        return hexes, title
+      end
+    end
+  end
+
+  -- 2. Fallback directo al API /api/today
+  local resFileName = safePath(tempDir, "bp_today_fallback.json")
+  local curlCmd = string.format('curl -s "https://basepaint.xyz/api/today" -o "%s"', resFileName)
+  executeSilent(curlCmd)
+
+  local fRes = io.open(resFileName, "r")
+  if fRes then
+    local jsonText = fRes:read("*all") or ""
+    fRes:close()
+    pcall(function() os.remove(resFileName) end)
+
+    local hexes = {}
+    for hex in jsonText:gmatch('#%x%x%x%x%x%x') do
+      table.insert(hexes, hex)
+    end
+    if #hexes > 0 then
+      return hexes, "Today's palette"
+    end
+  end
+
+  return nil, "No se pudo obtener la paleta de hoy."
+end
+
+-- Petición a BasePaint para un canvas específico
+fetchBasePaintDirect = function(dayNum)
+  local dStr = tostring(dayNum or ""):gsub("%s+", ""):upper()
+  local isTodayOrLatest = (dStr == "" or dStr == "HOY" or dStr == "TODAY" or dStr == "LATEST" or dStr == "NOW" or dStr == "CURRENT" or dStr == "ACTUAL")
+
+  if isTodayOrLatest then
+    return fetchTodayBasePaint()
+  end
+
+  local dNum = tonumber(dayNum) or 0
+  if dNum <= 0 then
+    return nil, "Número de canvas inválido."
+  end
+
+  -- 1. Intentar consulta ON-CHAIN directa al smart contract de BasePaint
+  local onChainHexes, onChainTitle = fetchOnChainBasePaint(dNum)
+  if onChainHexes and #onChainHexes > 0 then
+    return onChainHexes, onChainTitle
+  end
+
+  -- 2. Consultar GraphQL tanto para el canvas solicitado como para los últimos canvas activos
   local gqlReqFile = safePath(tempDir, "bp_gql_day_req.json")
   local gqlResFile = safePath(tempDir, "bp_gql_day_res.json")
 
   local reqFile = io.open(gqlReqFile, "w")
   if reqFile then
-    local queryStr = string.format('{"query":"query { canvas(id: %d) { id name palette } }"}', dNum)
+    local queryStr = string.format('{"query":"query { canvas(id: %d) { id name palette } latest: canvass(limit: 6, orderBy: \"id\", orderDirection: \"desc\") { items { id name palette } } }"}', dNum)
     reqFile:write(queryStr)
     reqFile:close()
   end
@@ -531,20 +663,53 @@ local function fetchBasePaintDirect(dayNum)
     pcall(function() os.remove(gqlReqFile) end)
     pcall(function() os.remove(gqlResFile) end)
 
-    local palStr = jsonText:match('"palette":%s*"([^"]+)"')
-    local nameStr = jsonText:match('"name":%s*"([^"]+)"')
-    if palStr and palStr ~= "" then
+    local exactMatch = nil
+    local firstValid = nil
+
+    for chunk in jsonText:gmatch("{[^{}]-}") do
+      local idVal = chunk:match('"id":%s*(%d+)')
+      local palVal = chunk:match('"palette":%s*"([^"]+)"')
+      local nameVal = chunk:match('"name":%s*"([^"]+)"')
+      if idVal and palVal and palVal:find('#') then
+        local itemObj = {
+          id = tonumber(idVal),
+          name = nameVal,
+          palette = palVal
+        }
+        if tonumber(idVal) == dNum then
+          exactMatch = itemObj
+          break
+        elseif not firstValid then
+          firstValid = itemObj
+        end
+      end
+    end
+
+    if exactMatch then
       local hexes = {}
-      for hex in palStr:gmatch('#%x%x%x%x%x%x') do
+      for hex in exactMatch.palette:gmatch('#%x%x%x%x%x%x') do
         table.insert(hexes, hex)
       end
       if #hexes > 0 then
-        return hexes, "Palette #" .. tostring(dNum)
+        local title = (exactMatch.name and exactMatch.name ~= "") and (exactMatch.name .. " (#" .. tostring(dNum) .. ")") or ("Palette #" .. tostring(dNum))
+        return hexes, title
+      end
+    end
+
+    if firstValid then
+      local hexes = {}
+      for hex in firstValid.palette:gmatch('#%x%x%x%x%x%x') do
+        table.insert(hexes, hex)
+      end
+      if #hexes > 0 then
+        local msg = string.format("El Canvas #%d no tiene datos en el indexador de BasePaint.\n\nSe cargó automáticamente el Canvas activo más cercano: #%d (%s).", dNum, firstValid.id, firstValid.name or "Hoy")
+        app.alert(msg)
+        return hexes, "Palette #" .. tostring(firstValid.id) .. " (" .. (firstValid.name or "Latest") .. ")"
       end
     end
   end
 
-  -- 2. Fallback a la REST API /api/art/{dayNum}
+  -- 3. Fallback a la REST API /api/art/{dayNum}
   local resFileName = safePath(tempDir, "basepaint_res.json")
   local url = "https://basepaint.xyz/api/art/" .. tostring(dNum)
   local curlCmd = string.format('curl -s "%s" -o "%s"', url, resFileName)
@@ -552,87 +717,74 @@ local function fetchBasePaintDirect(dayNum)
   executeSilent(curlCmd)
 
   local fRes = io.open(resFileName, "r")
-  if not fRes then
-    return nil, "No se pudo conectar a BasePaint API."
+  if fRes then
+    local jsonText = fRes:read("*all") or ""
+    fRes:close()
+    pcall(function() os.remove(resFileName) end)
+
+    local hexes = {}
+    for hex in jsonText:gmatch('#%x%x%x%x%x%x') do
+      table.insert(hexes, hex)
+    end
+
+    if #hexes > 0 then
+      return hexes, "Palette #" .. tostring(dNum)
+    end
   end
 
-  local jsonText = fRes:read("*all") or ""
-  fRes:close()
-  pcall(function() os.remove(resFileName) end)
+  return nil, "El Canvas #" .. tostring(dNum) .. " no se encontró o aún no está disponible."
+end
+
+-- Obtener la paleta actual del sprite abierto en Aseprite
+fetchCurrentAsepritePalette = function()
+  local sprite = app.activeSprite
+  if not sprite then
+    app.alert("No hay ningún dibujo/sprite activo en Aseprite.\nAbre un lienzo para leer su paleta.")
+    return nil, nil
+  end
+
+  local pal = sprite.palettes[1]
+  if not pal or #pal == 0 then
+    app.alert("El sprite activo no contiene colores en su paleta.")
+    return nil, nil
+  end
 
   local hexes = {}
-  for hex in jsonText:gmatch('#%x%x%x%x%x%x') do
-    table.insert(hexes, hex)
+  local seen = {}
+  for i = 0, #pal - 1 do
+    local color = pal:getColor(i)
+    if color and color.alpha > 0 then
+      local hex = string.format("#%02X%02X%02X", color.red, color.green, color.blue)
+      if not seen[hex] then
+        seen[hex] = true
+        table.insert(hexes, hex)
+      end
+    end
   end
 
   if #hexes == 0 then
-    return nil, "No se encontraron colores para la Palette #" .. tostring(dNum)
+    app.alert("No se encontraron colores visibles en la paleta del sprite activo.")
+    return nil, nil
   end
 
-  return hexes, "Palette #" .. tostring(dNum)
-end
-
--- Petición cURL a Gemini AI
-local function fetchFromGemini(apiKey, promptText)
-  if not apiKey or apiKey == "" then
-    app.alert("Por favor ingrese una API Key de Gemini válida.")
-    return
+  local name = "Paleta Aseprite Actual"
+  if sprite.filename and sprite.filename ~= "" then
+    local fName = (app.fs and app.fs.fileName and app.fs.fileName(sprite.filename)) or sprite.filename:match("([^/\\]+)$") or "Lienzo"
+    name = "Paleta de " .. fName
   end
 
-  saveApiKey(apiKey)
-
-  local reqFileName = safePath(tempDir, "gemini_req.json")
-  local resFileName = safePath(tempDir, "gemini_res.json")
-
-  local fullPrompt = promptText .. " Devuelve exclusivamente un JSON con claves de colores HEX #RRGGBB."
-
-  local jsonPayload = string.format([[{
-    "contents": [{
-      "parts": [{ "text": %q }]
-    }]
-  }]], fullPrompt)
-
-  local fReq = io.open(reqFileName, "w")
-  if fReq then
-    fReq:write(jsonPayload)
-    fReq:close()
-  end
-
-  local apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" .. apiKey
-  local curlCmd = string.format('curl -s -X POST -H "Content-Type: application/json" -d @"%s" "%s" -o "%s"', reqFileName, apiUrl, resFileName)
-
-  executeSilent(curlCmd)
-
-  local fRes = io.open(resFileName, "r")
-  if not fRes then
-    app.alert("No se pudo leer la respuesta del archivo temporal de cURL.\nAsegúrate de tener cURL instalado.")
-    return
-  end
-
-  local jsonText = fRes:read("*all") or ""
-  fRes:close()
-
-  pcall(function() os.remove(reqFileName) end)
-  pcall(function() os.remove(resFileName) end)
-
-  local hexes = {}
-  for hex in jsonText:gmatch('#%x%x%x%x%x%x') do
-    table.insert(hexes, hex)
-  end
-
-  local rampas = generateRampsFromHexes(hexes, "Gemini AI")
-  displayPreviewAndApply(rampas, "BasePaint - Paleta Generada por AI", hexes)
+  return hexes, name
 end
 
 -- =========================================================================
--- DIÁLOGO PRINCIPAL (UI)
+-- DIÁLOGO PRINCIPAL (UI) - SOLO BASEPAINT
 -- =========================================================================
-local mainDlg = Dialog({ title = "Palette helper" })
+local mainDlg = Dialog({ title = "Basepalette helper" })
 
 mainDlg:entry{
   id = "canvas_number",
   label = "Canvas #:",
-  text = "42"
+  text = "1101"
 }
 
 mainDlg:button{
@@ -641,14 +793,28 @@ mainDlg:button{
   onclick = function()
     local data = mainDlg.data
     local canvasNum = data.canvas_number:gsub("%s+", "")
-    if canvasNum == "" then canvasNum = "42" end
+    if canvasNum == "" then canvasNum = "HOY" end
 
     local hexes, name = fetchBasePaintDirect(canvasNum)
     if hexes and #hexes > 0 then
       local rampas = generateRampsFromHexes(hexes, name)
       displayPreviewAndApply(rampas, name or ("Palette #" .. canvasNum), hexes)
     else
-      app.alert("No se encontró la paleta #" .. canvasNum)
+      app.alert("No se encontró la paleta #" .. canvasNum .. ".\nVerifica que el Canvas exista o usa 'HOY' para el día actual.")
+    end
+  end
+}
+
+mainDlg:separator{}
+
+mainDlg:button{
+  id = "get_current_active",
+  text = "Use current palette",
+  onclick = function()
+    local hexes, name = fetchCurrentAsepritePalette()
+    if hexes and #hexes > 0 then
+      local rampas = generateRampsFromHexes(hexes, name)
+      displayPreviewAndApply(rampas, name, hexes)
     end
   end
 }
